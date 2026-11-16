@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Air Orchestra</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060a; overflow: hidden;
+               font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #eee; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  video { display: none; }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+             justify-content: center; gap: 18px; background: rgba(5, 6, 10, 0.9); text-align: center; padding: 24px; }
+  #overlay h1 { font-weight: 200; font-size: 64px; margin: 0; letter-spacing: 0.06em; }
+  #overlay p { opacity: 0.75; max-width: 560px; line-height: 1.6; margin: 0; }
+  #start { font-size: 20px; padding: 14px 40px; border-radius: 999px; border: none;
+           background: #fff; color: #000; cursor: pointer; }
+  #start:disabled { opacity: 0.5; cursor: wait; }
+  #status { font-size: 14px; min-height: 1.4em; }
+  #hud { position: fixed; left: 16px; bottom: 12px; font-size: 13px; opacity: 0.55; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="v" playsinline muted></video>
+
+<div id="overlay">
+  <h1>Air Orchestra</h1>
+  <p>Raise your hand to play higher notes. Move it left and right to change the sound.
+     Pinch your thumb and index finger together to play a drum. Two people can play at once.</p>
+  <button id="start">Start</button>
+  <p id="status"></p>
+</div>
+<div id="hud">1 / 2 / 3: change scale &nbsp;·&nbsp; V: camera image on/off &nbsp;·&nbsp; D: show hand skeleton</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tone@14.8.49/build/Tone.js"></script>
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ---------- Tunable settings ----------
+const CONFIG = {
+  smoothing: 0.35,      // 0..1, lower = smoother but slower hand movement
+  margin: 0.08,         // top/bottom part of the screen that is not used for notes
+  pinchOn: 0.30,        // pinch starts when thumb-index distance < this (relative to hand size)
+  pinchOff: 0.45,       // pinch ends when distance > this (prevents double triggers)
+  noteHysteresis: 0.2,  // how far past a note border you must move before the note changes
+  releaseFrames: 6,     // frames without a hand before its sound stops
+};
+
+const SCALES = {
+  "Pentatonic": ["C4", "D4", "E4", "G4", "A4", "C5", "D5", "E5", "G5", "A5", "C6"],
+  "Major":      ["C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5", "D5", "E5", "F5", "G5", "A5", "B5", "C6"],
+  "Minor pentatonic": ["A3", "C4", "D4", "E4", "G4", "A4", "C5", "D5", "E5", "G5", "A5"],
+};
+const SCALE_KEYS = Object.keys(SCALES);
+let scaleName = SCALE_KEYS[0];
+let showVideo = true;
+let debug = false;
+let scaleBanner = 0;
+
+// ---------- DOM / canvas ----------
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const video = document.getElementById("v");
+const overlay = document.getElementById("overlay");
+const startBtn = document.getElementById("start");
+const statusEl = document.getElementById("status");
+const setStatus = (t) => { statusEl.textContent = t; };
+
+let W = 0, H = 0;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+// Rectangle where the camera image is drawn ("cover" the screen, keep aspect ratio)
+function coverRect() {
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  const s = Math.max(W / vw, H / vh);
+  const dw = vw * s, dh = vh * s;
+  return { dx: (W - dw) / 2, dy: (H - dh) / 2, dw, dh };
+}
+// Landmark (normalized camera coords) -> screen pixels, mirrored like a selfie
+function toScreen(p, r) {
+  return { x: r.dx + (1 - p.x) * r.dw, y: r.dy + p.y * r.dh };
+}
+
+// ---------- Audio ----------
+let voices = null;
+function setupAudio() {
+  const reverb = new Tone.Reverb({ decay: 4, wet: 0.35 }).toDestination();
+
+  const kick = new Tone.MembraneSynth({ octaves: 6, pitchDecay: 0.05 }).connect(reverb);
+  kick.volume.value = -4;
+  const hat = new Tone.NoiseSynth({ noise: { type: "white" },
+    envelope: { attack: 0.001, decay: 0.12, sustain: 0 } }).connect(reverb);
+  hat.volume.value = -14;
+
+  const makeVoice = (oscType, hue, drum) => {
+    const filter = new Tone.Filter(1200, "lowpass").connect(reverb);
+    const synth = new Tone.Synth({
+      oscillator: { type: oscType },
+      envelope: { attack: 0.08, decay: 0.2, sustain: 0.8, release: 0.8 },
+      portamento: 0.04,
+    }).connect(filter);
+    synth.volume.value = -10;
+    return { synth, filter, drum, hue,
+             active: false, note: null, idx: -1, sx: null, sy: null,
+             pinched: false, missing: 0, lm: null, flash: 0 };
+  };
+
+  voices = {
+    Left:  makeVoice("triangle", 190, () => kick.triggerAttackRelease("C1", "8n")),
+    Right: makeVoice("sawtooth", 320, () => hat.triggerAttackRelease("16n")),
+  };
+}
+
+// ---------- Camera + hand tracking ----------
+async function setupCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false });
+  video.srcObject = stream;
+  await video.play();
+}
+
+let landmarker = null;
+async function setupVision() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const options = (delegate) => ({
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate,
+    },
+    runningMode: "VIDEO",
+    numHands: 2,
+  });
+  try {
+    landmarker = await HandLandmarker.createFromOptions(fileset, options("GPU"));
+  } catch (e) {
+    console.warn("GPU delegate failed, falling back to CPU", e);
+    landmarker = await HandLandmarker.createFromOptions(fileset, options("CPU"));
+  }
+}
+
+// ---------- Interaction ----------
+function updateHand(v, lm, rect) {
+  v.missing = 0;
+  v.lm = lm;
+
+  // Index fingertip position on screen, normalized 0..1
+  const tip = toScreen(lm[8], rect);
+  const nx = clamp(tip.x / W, 0, 1), ny = clamp(tip.y / H, 0, 1);
+  const a = CONFIG.smoothing;
+  v.sx = v.sx == null ? nx : v.sx + (nx - v.sx) * a;
+  v.sy = v.sy == null ? ny : v.sy + (ny - v.sy) * a;
+
+  // Height -> note (locked to the scale, with hysteresis against jitter)
+  const notes = SCALES[scaleName];
+  const t = clamp((1 - v.sy - CONFIG.margin) / (1 - 2 * CONFIG.margin), 0, 0.9999);
+  const f = t * notes.length;
+  let idx = Math.floor(f);
+  if (v.idx >= 0 && v.idx < notes.length &&
+      f > v.idx - CONFIG.noteHysteresis && f < v.idx + 1 + CONFIG.noteHysteresis) {
+    idx = v.idx;
+  }
+  const note = notes[idx];
+  if (!v.active) {
+    v.synth.triggerAttack(note);
+    v.active = true;
+  } else if (note !== v.note) {
+    v.synth.setNote(note);
+    v.flash = 1;
+  }
+  v.note = note; v.idx = idx;
+
+  // Left/right -> brightness of the sound (filter cutoff 200 Hz .. 6 kHz)
+  v.filter.frequency.rampTo(200 * Math.pow(30, v.sx), 0.05);
+
+  // Pinch -> drum hit
+  const handSize = dist(lm[0], lm[9]) || 1e-3;
+  const pinch = dist(lm[4], lm[8]) / handSize;
+  if (!v.pinched && pinch < CONFIG.pinchOn) {
+    v.pinched = true;
+    v.drum();
+    burst(v);
+  } else if (v.pinched && pinch > CONFIG.pinchOff) {
+    v.pinched = false;
+  }
+
+  trail(v);
+}
+
+function handLost(v) {
+  v.missing++;
+  if (v.active && v.missing > CONFIG.releaseFrames) {
+    v.synth.triggerRelease();
+    Object.assign(v, { active: false, note: null, idx: -1, sx: null, sy: null, pinched: false, lm: null });
+  }
+}
+
+// ---------- Particles ----------
+const particles = [];
+function noteHue(v) { return v.hue + v.idx * 7; }
+function trail(v) {
+  const x = v.sx * W, y = v.sy * H;
+  for (let i = 0; i < 3; i++) {
+    particles.push({ x, y, vx: (Math.random() - 0.5) * 1.4, vy: (Math.random() - 0.5) * 1.4 - 0.4,
+                     life: 1, decay: 0.012 + Math.random() * 0.01, hue: noteHue(v), size: 2 + Math.random() * 4 });
+  }
+}
+function burst(v) {
+  const x = v.sx * W, y = v.sy * H;
+  for (let i = 0; i < 50; i++) {
+    const ang = Math.random() * Math.PI * 2, sp = 3 + Math.random() * 6;
+    particles.push({ x, y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp,
+                     life: 1, decay: 0.02 + Math.random() * 0.02, hue: noteHue(v) + 40, size: 2 + Math.random() * 3 });
+  }
+}
+
+// ---------- Drawing ----------
+function drawScaleLines() {
+  const notes = SCALES[scaleName];
+  const n = notes.length, m = CONFIG.margin;
+  ctx.font = "12px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+  for (let i = 0; i < n; i++) {
+    const yTop = (1 - m - ((i + 1) / n) * (1 - 2 * m)) * H;
+    const yBot = (1 - m - (i / n) * (1 - 2 * m)) * H;
+    for (const key of ["Left", "Right"]) {
+      const v = voices[key];
+      if (v.active && v.idx === i) {
+        ctx.fillStyle = `hsla(${noteHue(v)}, 80%, 55%, ${0.08 + v.flash * 0.15})`;
+        ctx.fillRect(0, yTop, W, yBot - yTop);
+      }
+    }
+    ctx.strokeStyle = "rgba(255,255,255,0.06)";
+    ctx.beginPath(); ctx.moveTo(0, yBot); ctx.lineTo(W, yBot); ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.fillText(notes[i].replace(/\d/, ""), 12, (yTop + yBot) / 2);
+  }
+}
+
+function drawSkeleton(v, rect) {
+  if (!v.lm) return;
+  ctx.fillStyle = `hsla(${v.hue}, 80%, 70%, 0.8)`;
+  for (const p of v.lm) {
+    const s = toScreen(p, rect);
+    ctx.beginPath(); ctx.arc(s.x, s.y, 3, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function draw(rect) {
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "#05060a";
+  ctx.fillRect(0, 0, W, H);
+
+  if (showVideo && video.readyState >= 2) {
+    ctx.save();
+    ctx.globalAlpha = 0.22;
+    ctx.translate(W, 0); ctx.scale(-1, 1);
+    ctx.drawImage(video, rect.dx, rect.dy, rect.dw, rect.dh);
+    ctx.restore();
+  }
+
+  drawScaleLines();
+
+  // Particles (additive glow)
+  ctx.globalCompositeOperation = "lighter";
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vx *= 0.97; p.vy *= 0.97; p.life -= p.decay;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    ctx.fillStyle = `hsla(${p.hue}, 90%, 60%, ${p.life})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size * p.life + 0.5, 0, Math.PI * 2); ctx.fill();
+  }
+  if (particles.length > 2500) particles.splice(0, particles.length - 2500);
+
+  // Fingertip glow
+  for (const key of ["Left", "Right"]) {
+    const v = voices[key];
+    if (!v.active) continue;
+    const x = v.sx * W, y = v.sy * H, r = 40 + v.flash * 30;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `hsla(${noteHue(v)}, 90%, 70%, 0.9)`);
+    g.addColorStop(1, `hsla(${noteHue(v)}, 90%, 50%, 0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    v.flash *= 0.9;
+  }
+  ctx.globalCompositeOperation = "source-over";
+
+  if (debug) for (const key of ["Left", "Right"]) drawSkeleton(voices[key], rect);
+
+  if (scaleBanner > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${Math.min(1, scaleBanner)})`;
+    ctx.font = "300 28px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(scaleName, W / 2, 48);
+    ctx.textAlign = "start";
+    scaleBanner -= 0.02;
+  }
+}
+
+// ---------- Main loop ----------
+let lastVideoTime = -1;
+let results = null;
+function loop() {
+  requestAnimationFrame(loop);
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    results = landmarker.detectForVideo(video, performance.now());
+  }
+  const rect = coverRect();
+  const seen = new Set();
+  const hands = results?.landmarks ?? [];
+  const labels = results?.handedness ?? results?.handednesses ?? [];
+  hands.forEach((lm, i) => {
+    let label = labels[i]?.[0]?.categoryName === "Right" ? "Right" : "Left";
+    if (seen.has(label)) label = label === "Left" ? "Right" : "Left";
+    seen.add(label);
+    updateHand(voices[label], lm, rect);
+  });
+  for (const key of ["Left", "Right"]) if (!seen.has(key)) handLost(voices[key]);
+  draw(rect);
+}
+
+// ---------- Controls ----------
+window.addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  if (["1", "2", "3"].includes(k)) {
+    scaleName = SCALE_KEYS[Number(k) - 1];
+    scaleBanner = 2;
+    if (voices) for (const v of Object.values(voices)) v.idx = -1;
+  } else if (k === "v") showVideo = !showVideo;
+  else if (k === "d") debug = !debug;
+});
+
+startBtn.addEventListener("click", async () => {
+  startBtn.disabled = true;
+  try {
+    setStatus("Starting audio…");
+    await Tone.start();
+    if (!voices) setupAudio();
+    setStatus("Opening camera…");
+    await setupCamera();
+    setStatus("Loading hand tracking model…");
+    if (!landmarker) await setupVision();
+    overlay.style.display = "none";
+    loop();
+  } catch (e) {
+    console.error(e);
+    setStatus("Could not start: " + (e.message || e) + ". Check camera permission and internet connection.");
+    startBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
